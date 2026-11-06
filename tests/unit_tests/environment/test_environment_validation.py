@@ -27,14 +27,11 @@ from nemo_gym.environment.validation import (
 @pytest.mark.parametrize(
     "name",
     [
-        "terminal_bench_4/miniswe",
-        "terminal_bench_science/miniswe",
-        "terminal_bench_science/codex",
-        "deepsearchqa",
-        "widesearch",
-        "fukuyamabench",
-        "moldetox",
-        "scicodepile",
+        "agentic_if",
+        "agentif",
+        "ifbench",
+        "ifeval",
+        "iheval",
         "partner_if",
     ],
 )

@@ -124,15 +124,14 @@ def test_resources_rename_ignores_non_resources_destination() -> None:
     assert resolved.environment.environment_servers.single_agent_turn.resources_server.name == "renamed_resources"
 
 
-def test_indic_math_environment_follows_its_resources_rename() -> None:
-    resolved = _parse(OmegaConf.create({"config_paths": ["benchmarks/indic/math_500/config.yaml"]}))
-    environment = resolved.math_with_judge_environment_server.environment_servers.single_agent_turn_legacy
+def test_ifbench_environment_follows_its_resources_rename() -> None:
+    resolved = _parse(OmegaConf.create({"config_paths": ["benchmarks/ifbench/config.yaml"]}))
+    environment = resolved.ifbench_benchmark_environment_server.environment_servers.single_agent_turn_legacy
 
-    assert "math_with_judge" not in resolved
-    assert environment.agent_server.name == "indic_math_500_math_with_judge_simple_agent"
-    assert environment.resources_server.name == "indic_math_500_math_with_judge_resources_server"
-    resources = resolved[environment.resources_server.name].resources_servers.math_with_judge
-    assert resources.format_tolerant_answer_extraction is True
+    assert environment.agent_server.name == "ifbench_benchmark_simple_agent"
+    assert environment.resources_server.name == "ifbench_benchmark_resources_server"
+    resources = resolved[environment.resources_server.name].resources_servers.ifbench
+    assert resources.domain == "instruction_following"
 
 
 def test_indic_ifeval_explicitly_binds_its_copy_while_english_resources_survive() -> None:
@@ -145,8 +144,8 @@ def test_indic_ifeval_explicitly_binds_its_copy_while_english_resources_survive(
     assert environment.resources_server.name == "indic_ifeval_instruction_following"
 
 
-@pytest.mark.parametrize("benchmarks", [("math-500", "aime24"), ("aime24", "math-500")])
-def test_math_benchmark_environments_bind_their_own_resources(benchmarks: tuple[str, str]) -> None:
+@pytest.mark.parametrize("benchmarks", [("ifbench", "ifeval"), ("ifeval", "ifbench")])
+def test_instruction_following_benchmarks_bind_their_own_resources(benchmarks: tuple[str, str]) -> None:
     resolved = _parse(OmegaConf.create({"config_paths": [f"benchmarks/{name}/config.yaml" for name in benchmarks]}))
     bindings = {
         name: instance.environment_servers.single_agent_turn_legacy.resources_server.name
@@ -155,6 +154,6 @@ def test_math_benchmark_environments_bind_their_own_resources(benchmarks: tuple[
     }
 
     assert bindings == {
-        "math_500_math_with_judge_environment_server": "math_500_math_with_judge_resources_server",
-        "aime24_math_with_judge_environment_server": "aime24_math_with_judge_resources_server",
+        "ifbench_benchmark_environment_server": "ifbench_benchmark_resources_server",
+        "ifeval_instruction_following_environment_server": "instruction_following",
     }

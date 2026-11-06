@@ -227,16 +227,21 @@ async def test_session_execution_preserves_env_and_user(tmp_path, user):
 
 @pytest.mark.parametrize("recovers", [True, False])
 @pytest.mark.parametrize("timeout_kind", ["client", "server", "readiness"])
-async def test_tb4_create_timeout_retries_with_jitter(monkeypatch, recovers, timeout_kind):
+async def test_create_timeout_retries_with_jitter(monkeypatch, recovers, timeout_kind):
     import tenacity
     import tenacity.wait
-    import yaml
     from opensandbox.exceptions import SandboxApiException, SandboxReadyTimeoutException
 
-    config = yaml.safe_load(Path("benchmarks/terminal_bench_4/resources.yaml").read_text())
-    environment = config["terminal_bench_4"]["resources_servers"]["terminal_bench_4"]["environment"]
     provider = opensandbox_provider.OpenSandboxProvider(
-        create=environment["sandbox_provider"]["opensandbox"]["create"]
+        create={
+            "retries": 5,
+            "retry_delay_s": 5,
+            "retry_max_delay_s": 60,
+            "request_timeout_s": 300,
+            "timeout_s": 300,
+            "connect_attempt_timeout_s": 300,
+            "renew_interval_s": 1800,
+        }
     )
     errors = {
         "client": sandbox_failure(operation="create", failure_kind="provider_create_timeout", reason="create timeout"),

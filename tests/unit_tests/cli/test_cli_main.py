@@ -1577,8 +1577,8 @@ class TestAssetSelectors:
     def test_environment_selector_resolves_to_config(self, monkeypatch: MonkeyPatch) -> None:
         # Environments mirror benchmarks: `--environment <name>` loads `environments/<name>/config.yaml`.
         # Used by `gym env start` / `gym eval run` for environments/ (see environments/*/README.md).
-        _, overrides = _dispatch_for(monkeypatch, ["env", "start", "--environment", "circle_count"])
-        assert overrides == [f"+config_paths=[{WORKING_DIR / 'environments/circle_count/config.yaml'}]"]
+        _, overrides = _dispatch_for(monkeypatch, ["env", "start", "--environment", "instruction_following"])
+        assert overrides == [f"+config_paths=[{WORKING_DIR / 'environments/instruction_following/config.yaml'}]"]
 
     def test_nested_manifest_wins_over_legacy_flavor_with_the_same_name(
         self, monkeypatch: MonkeyPatch, tmp_path: Path
