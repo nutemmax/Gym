@@ -227,11 +227,11 @@ class TestDiscoverEnvironments:
 
 
 class TestRealEnvironments:
-    def test_workplace_assistant_is_discoverable(self) -> None:
-        # The repo ships environments/workplace_assistant/ — the registry must find it by name.
+    def test_instruction_following_is_discoverable(self) -> None:
+        # The repo ships environments/instruction_following/ — the registry must find it by name.
         environments = discover_environments()
-        assert "workplace_assistant" in environments
-        assert environments["workplace_assistant"].config_path.name == "config.yaml"
+        assert "instruction_following" in environments
+        assert environments["instruction_following"].config_path.name == "config.yaml"
 
 
 class TestDiscoverEnvironmentsAcrossRoots:
@@ -242,7 +242,7 @@ class TestDiscoverEnvironmentsAcrossRoots:
         environments = discover_environments()
 
         assert "custom_env" in environments  # a user-supplied environment is discovered
-        assert "workplace_assistant" in environments  # ...alongside the built-ins
+        assert "instruction_following" in environments  # ...alongside the built-ins
 
     def test_cwd_is_scanned_by_default(self, tmp_path: Path, monkeypatch) -> None:
         _make_env(tmp_path / "environments", "cwd_env", _ENV_CONFIG.format(name="cwd_env"))
