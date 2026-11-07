@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[project]
+name = "gym-resources-servers-ifgym"
+version = "0.0.0"
+requires-python = ">=3.13.14"
+dependencies = ["nemo-gym[dev]", "ifgym", "immutabledict"]
+
+[tool.uv]
+package = false
+
+[tool.setuptools]
+py-modules = []
+
+[tool.uv.sources]
+nemo-gym = { path = "../..", editable = true }
+ifgym = { path = "../../..", editable = true }
+
+[tool.uv.workspace]
+members = []
