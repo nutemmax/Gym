@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[project]
+name = "gym-responses-api-agents-ifgym-agent"
+version = "0.0.0"
+requires-python = ">=3.13.14"
+dependencies = ["nemo-gym[dev]"]
+
+[tool.uv]
+package = false
+
+[tool.setuptools]
+py-modules = []
+
+[tool.uv.sources]
+nemo-gym = { path = "../..", editable = true }
+
+[tool.uv.workspace]
+members = []
