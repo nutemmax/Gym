@@ -4,20 +4,31 @@
 from typing import Optional
 
 from fastapi import FastAPI, Request
+from pydantic import PositiveInt
 
 
 try:
     from nemo_gym.client import SESSION_ID_KEY
     from nemo_gym.core import NeMoGymResponse
+    from nemo_gym.server_runtime import BaseResourcesServerConfig
 except ImportError:
     # The Gym revision pinned by rl-infra predates the package reorganization.
     from nemo_gym.openai_utils import NeMoGymResponse
     from nemo_gym.server_utils import SESSION_ID_KEY
+    from nemo_gym.base_resources_server import BaseResourcesServerConfig
 from resources_servers.gymnasium import EnvResetRequest, EnvResetResponse, GymnasiumServer, extract_text
 from resources_servers.ifgym.episode import Episode, initial_user_text
 
+CONTEXT_WINDOW_EXCEEDED_METADATA_KEY = "nemo_gym_context_window_exceeded"
+
+
+class IFGymResourcesServerConfig(BaseResourcesServerConfig):
+    max_total_sequence_length: PositiveInt
+
 
 class IFGymServer(GymnasiumServer):
+    config: IFGymResourcesServerConfig
+
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
         app.post("/close")(self.close_episode)
@@ -64,12 +75,23 @@ class IFGymServer(GymnasiumServer):
         answer = extract_text(action)
         details = action.incomplete_details
         usage = action.usage
+        metadata = action.metadata or {}
+        sequence_limit_reached = (
+            usage is not None
+            and usage.input_tokens is not None
+            and usage.output_tokens is not None
+            and usage.input_tokens + usage.output_tokens >= self.config.max_total_sequence_length
+        )
         if (
-            action.status == "incomplete"
-            and details is not None
-            and details.reason == "max_output_tokens"
-            and not answer
-            and (usage is None or usage.output_tokens == 0)
+            metadata.get(CONTEXT_WINDOW_EXCEEDED_METADATA_KEY) == "true"
+            or sequence_limit_reached
+            or (
+                action.status == "incomplete"
+                and details is not None
+                and details.reason == "max_output_tokens"
+                and not answer
+                and (usage is None or usage.output_tokens == 0)
+            )
         ):
             return None, 0.0, False, True, {
                 "sample_id": episode.sample_id,

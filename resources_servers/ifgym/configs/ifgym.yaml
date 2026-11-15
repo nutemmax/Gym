@@ -4,6 +4,7 @@ ifgym_resources_server:
       entrypoint: app.py
       domain: instruction_following
       verified: false
+      max_total_sequence_length: ${oc.env:IFGYM_MAX_TOTAL_SEQUENCE_LENGTH,32768}
       allowed_agents: [ifgym_agent]
       description: Multi-turn instruction following with deterministic per-turn rewards
 ifgym_agent:
