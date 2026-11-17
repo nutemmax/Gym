@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
 from typing import Mapping
 from uuid import uuid4
 
@@ -74,6 +75,86 @@ class Episode:
         self.details: list[dict] = []
         self.index = 0
 
+    @staticmethod
+    def _validate_preference_binding(binding: object, turns: list[dict], introduced_at: int, handle: str) -> None:
+        if not isinstance(binding, dict) or binding.get("status") != "active":
+            raise ValueError(f"active preference constraint {handle!r} requires an active preference binding")
+
+        turn_by_idx = {turn.get("turn_idx"): turn for turn in turns if isinstance(turn, dict)}
+        required_text = (
+            "preference_id",
+            "preference_text",
+            "scope",
+            "origin_task_id",
+            "origin_user_text",
+            "origin_user_text_sha256",
+            "origin_user_quote",
+        )
+        if any(not isinstance(binding.get(key), str) or not binding[key].strip() for key in required_text):
+            raise ValueError(f"preference binding for {handle!r} has missing text fields")
+        origin_turn = binding.get("origin_turn")
+        if not isinstance(origin_turn, int) or isinstance(origin_turn, bool) or not 0 < origin_turn < introduced_at:
+            raise ValueError(f"preference binding for {handle!r} must originate before introduction")
+        origin = turn_by_idx.get(origin_turn)
+        origin_text = origin.get("task_text") if origin else None
+        if (
+            not isinstance(origin_text, str)
+            or binding["origin_user_text"] != origin_text
+            or binding["origin_user_text_sha256"] != sha256(origin_text.encode("utf-8")).hexdigest()
+            or binding["origin_user_quote"] not in origin_text
+            or binding["origin_user_quote"] not in origin.get("rendered_prompt", "")
+        ):
+            raise ValueError(f"preference binding for {handle!r} does not match visible origin text")
+
+        updates = binding.get("updates")
+        if not isinstance(updates, list) or not updates:
+            raise ValueError(f"preference binding for {handle!r} requires ordered preference updates")
+        prior_turn = 0
+        for index, update in enumerate(updates):
+            if not isinstance(update, dict):
+                raise ValueError(f"preference update for {handle!r} must be an object")
+            event_turn = update.get("turn")
+            task_id = update.get("task_id")
+            action = update.get("action")
+            task_hash = update.get("user_text_sha256")
+            quote = update.get("visible_user_quote")
+            preference_text = update.get("preference_text")
+            scope = update.get("scope")
+            visible_turn = turn_by_idx.get(event_turn) if isinstance(event_turn, int) else None
+            visible_text = visible_turn.get("task_text") if visible_turn else None
+            if (
+                action not in {"set", "replace"}
+                or not isinstance(event_turn, int)
+                or isinstance(event_turn, bool)
+                or not prior_turn < event_turn < introduced_at
+                or not isinstance(task_id, str)
+                or not task_id
+                or not isinstance(visible_text, str)
+                or task_hash != sha256(visible_text.encode("utf-8")).hexdigest()
+                or not isinstance(quote, str)
+                or not quote
+                or quote not in visible_text
+                or quote not in visible_turn.get("rendered_prompt", "")
+                or not isinstance(preference_text, str)
+                or not preference_text.strip()
+                or not isinstance(scope, str)
+                or not scope.strip()
+            ):
+                raise ValueError(f"preference update for {handle!r} does not match ordered visible user text")
+            if index == 0 and (
+                event_turn != origin_turn
+                or task_id != binding["origin_task_id"]
+                or visible_text != binding["origin_user_text"]
+                or quote != binding["origin_user_quote"]
+                or preference_text != binding["preference_text"]
+                and len(updates) == 1
+            ):
+                raise ValueError(f"preference binding for {handle!r} has a mismatched origin event")
+            prior_turn = event_turn
+        last_update = updates[-1]
+        if last_update["preference_text"] != binding["preference_text"] or last_update["scope"] != binding["scope"]:
+            raise ValueError(f"preference binding for {handle!r} does not match its latest update")
+
     def _validate_semantic_contract(self, episode_data: dict) -> dict[str, dict]:
         has_semantic = any(
             event.get("type") == "introduce"
@@ -115,6 +196,13 @@ class Episode:
                     raise ValueError(f"semantic introduction wording is missing for handle {handle!r}")
                 if row.get("introduced_at") != turn.get("turn_idx"):
                     raise ValueError(f"semantic introduction turn is mismatched for handle {handle!r}")
+                if cid == "history:respect_prior_user_preference":
+                    self._validate_preference_binding(
+                        row.get("preference_binding"),
+                        episode_data["turns"],
+                        row["introduced_at"],
+                        handle,
+                    )
                 semantic_introductions[handle] = row
         return semantic_introductions
 

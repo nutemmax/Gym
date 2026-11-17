@@ -68,7 +68,11 @@ def test_examples_and_mocked_complete_rollouts():
             assert [c["constraint_id"] for c in detail["checks"]] == [
                 c["constraint_id"] for c in turns[index]["active_constraints"]
             ]
-            assert all(c["checked"] and "error" not in c for c in detail["checks"])
+            assert all(c["checked"] and "error" not in c for c in detail["checks"]), [
+                (c["constraint_id"], c.get("passed"), c.get("error", {}).get("type"))
+                for c in detail["checks"]
+                if not c["checked"] or "error" in c
+            ]
             for check in detail["checks"]:
                 checker = INSTRUCTION_DICT[check["constraint_id"]](check["constraint_id"])
                 checker.build_description(**check["effective_kwargs"])
@@ -96,7 +100,10 @@ def test_history_constraint_receives_only_prior_assistant_responses():
         c for c in info["turn_details"][-1]["checks"] if c["constraint_id"] == "history:reuse_earlier_word"
     )
     assert full_history["effective_kwargs"]["previous_responses"] == ["blue blue water", "Green landscape is quiet"]
-    assert reward == 1.0
+    assert reward == 1.0, [
+        (c["constraint_id"], c.get("passed"), c.get("error", {}).get("type"))
+        for c in info["turn_details"][-1]["checks"]
+    ]
 
 
 def test_snapshot_mismatch_and_unknown_constraint_are_rejected():
