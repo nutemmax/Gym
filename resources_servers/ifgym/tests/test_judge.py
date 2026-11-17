@@ -35,6 +35,8 @@ def test_strict_binary_verdicts(verdict, score):
         (completion('{"verdict":"maybe"}'), "invalid_verdict"),
         (completion('{"verdict":[]}'), "invalid_verdict"),
         (completion('{"verdict":"pass"}', finish_reason="length"), "truncated_or_filtered"),
+        (completion('{"verdict":"pass"}', finish_reason=None), "invalid_finish_reason"),
+        ({"choices": [{"finish_reason": "stop", "message": {"content": '{"verdict":"pass"}', "tool_calls": [{"id":"x"}]}}]}, "tool_call"),
         (completion('{"verdict":"pass"}', refusal="I cannot do that"), "refusal"),
         (completion('{"verdict":"pass"}', choices_count=2), "invalid_response"),
         ({"choices": []}, "invalid_response"),
@@ -95,3 +97,34 @@ def test_adapter_uses_native_server_and_schema(monkeypatch):
     assert observed["server_name"] == "ifgym_judge_model"
     assert observed["url_path"] == "/v1/chat/completions"
     assert observed["json"]["response_format"]["json_schema"]["strict"] is True
+
+
+def test_adapter_retries_invalid_output_once(monkeypatch):
+    from resources_servers.ifgym import judge
+
+    observed = {"calls": 0}
+
+    class FakeClient:
+        async def post(self, **kwargs):
+            observed["calls"] += 1
+            observed["transport_attempts"] = kwargs["_max_num_tries"]
+            return object()
+
+    async def run():
+        async def status(_response):
+            return None
+
+        async def get_json(_response):
+            if observed["calls"] == 1:
+                return completion("not json")
+            return completion('{"verdict":"fail"}')
+
+        monkeypatch.setattr(judge, "_raise_for_status", status)
+        monkeypatch.setattr(judge, "_get_response_json", get_json)
+        result = await JudgeAdapter(FakeClient()).score({"target": "trusted rubric"})
+        assert result.verdict == "fail"
+        assert result.score == 0
+        assert result.provenance["attempts"] == "2"
+
+    asyncio.run(run())
+    assert observed == {"calls": 2, "transport_attempts": 1}

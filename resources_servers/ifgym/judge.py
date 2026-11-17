@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from hashlib import sha256
 from typing import Any, Literal, Mapping
 
 
@@ -19,13 +20,19 @@ contract or evidence is missing, contradictory, or insufficient.
 Return exactly one JSON object: {"verdict":"pass"}, {"verdict":"fail"}, or {"verdict":"uncertain"}.
 No explanation, Markdown, confidence, or additional keys."""
 async def _raise_for_status(response: Any) -> None:
-    from nemo_gym.client import raise_for_status
+    try:
+        from nemo_gym.client import raise_for_status
+    except ImportError:
+        from nemo_gym.server_utils import raise_for_status
 
     await raise_for_status(response)
 
 
 async def _get_response_json(response: Any) -> Any:
-    from nemo_gym.client import get_response_json
+    try:
+        from nemo_gym.client import get_response_json
+    except ImportError:
+        from nemo_gym.server_utils import get_response_json
 
     return await get_response_json(response)
 
@@ -33,7 +40,7 @@ async def _get_response_json(response: Any) -> Any:
 JUDGE_RESPONSE_FORMAT = {
     "type": "json_schema",
     "json_schema": {
-        "name": "ifgym_constraint_verdict",
+        "name": "constraint_verdict",
         "strict": True,
         "schema": {
             "type": "object",
@@ -57,6 +64,7 @@ class UnresolvedGradeError(RuntimeError):
 class JudgeResult:
     verdict: Literal["pass", "fail"]
     score: int
+    provenance: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.verdict not in {"pass", "fail"} or self.score != (1 if self.verdict == "pass" else 0):
@@ -78,13 +86,17 @@ def parse_verdict_response(response: Mapping[str, Any]) -> JudgeResult:
     if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], Mapping):
         raise UnresolvedGradeError("invalid_response", "judge must return exactly one choice")
     choice = choices[0]
-    if choice.get("finish_reason") in {"length", "content_filter"}:
-        raise UnresolvedGradeError("truncated_or_filtered", "judge output was truncated or filtered")
+    finish_reason = choice.get("finish_reason")
+    if finish_reason != "stop":
+        code = "truncated_or_filtered" if finish_reason in {"length", "content_filter"} else "invalid_finish_reason"
+        raise UnresolvedGradeError(code, "judge output did not finish as one complete text choice")
     message = choice.get("message")
     if not isinstance(message, Mapping):
         raise UnresolvedGradeError("invalid_response", "judge choice has no message")
     if message.get("refusal"):
         raise UnresolvedGradeError("refusal", "judge refused to grade")
+    if message.get("tool_calls") or message.get("function_call"):
+        raise UnresolvedGradeError("tool_call", "judge returned a tool call instead of a verdict")
     content = message.get("content")
     if not isinstance(content, str):
         raise UnresolvedGradeError("invalid_response", "judge content must be a JSON string")
@@ -117,6 +129,7 @@ def chat_request(context: Mapping[str, Any]) -> dict[str, Any]:
         ],
         "temperature": 0,
         "max_tokens": 128,
+        "stream": False,
         "response_format": JUDGE_RESPONSE_FORMAT,
     }
 
@@ -140,23 +153,67 @@ class JudgeAdapter:
         self.timeout_seconds = timeout_seconds
 
     async def score(self, context: Mapping[str, Any]) -> JudgeResult:
-        request = chat_request(context)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.timeout_seconds
         try:
-            async with asyncio.timeout(self.timeout_seconds):
-                async with self.semaphore:
-                    response = await self.server_client.post(
-                        server_name=self.model_server_name,
-                        url_path="/v1/chat/completions",
-                        json=request,
-                    )
-                    await _raise_for_status(response)
-                    payload = await _get_response_json(response)
-            if not isinstance(payload, Mapping):
-                raise UnresolvedGradeError("invalid_response", "judge response must be an object")
-            return parse_verdict_response(payload)
+            async with asyncio.timeout_at(deadline):
+                request = chat_request(context)
+                for attempt in (1, 2):
+                    try:
+                        async with self.semaphore:
+                            response = await self.server_client.post(
+                                server_name=self.model_server_name,
+                                url_path="/v1/chat/completions",
+                                json=request,
+                                _max_num_tries=1,
+                            )
+                            await _raise_for_status(response)
+                            payload = await _get_response_json(response)
+                        if not isinstance(payload, Mapping):
+                            raise UnresolvedGradeError("invalid_response", "judge response must be an object")
+                        result = parse_verdict_response(payload)
+                        if loop.time() > deadline:
+                            raise TimeoutError("judge response parsing exceeded deadline")
+                        request_hash = sha256(
+                            json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                        ).hexdigest()
+                        return JudgeResult(
+                            verdict=result.verdict,
+                            score=result.score,
+                            provenance={
+                                "model_server": self.model_server_name,
+                                "request_sha256": request_hash,
+                                "response_model": str(payload.get("model", "")),
+                                "attempts": str(attempt),
+                            },
+                        )
+                    except UnresolvedGradeError as error:
+                        retryable = error.code in {
+                            "invalid_response",
+                            "invalid_finish_reason",
+                            "truncated_or_filtered",
+                            "tool_call",
+                            "invalid_json",
+                            "invalid_schema",
+                            "invalid_verdict",
+                            "transport_error",
+                        }
+                        if not retryable or attempt == 2:
+                            raise
+                    except Exception as error:
+                        status = getattr(error, "status", getattr(error, "status_code", None))
+                        if status is not None and status != 429 and status < 500:
+                            raise UnresolvedGradeError(
+                                "upstream_rejected", "judge server rejected the request"
+                            ) from error
+                        if attempt == 2:
+                            raise UnresolvedGradeError("transport_error", "judge request failed") from error
+                if loop.time() > deadline:
+                    raise TimeoutError("judge request exceeded its deadline")
         except UnresolvedGradeError:
             raise
         except TimeoutError as error:
             raise UnresolvedGradeError("timeout", "judge request exceeded its deadline") from error
         except Exception as error:
             raise UnresolvedGradeError("transport_error", "judge request failed") from error
+        raise UnresolvedGradeError("transport_error", "judge request failed after bounded recovery")
