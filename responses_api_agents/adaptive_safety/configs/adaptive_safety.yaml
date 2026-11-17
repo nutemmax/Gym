@@ -1,0 +1,32 @@
+adaptive_safety_agent:
+  responses_api_agents:
+    adaptive_safety:
+      entrypoint: app.py
+      num_workers: 1
+      model_server: {type: responses_api_models, name: policy_model}
+      attacker_model_server: {type: responses_api_models, name: adaptive_attacker_model}
+      judge_model_server: {type: responses_api_models, name: adaptive_judge_model}
+      validator_model_server: {type: responses_api_models, name: adaptive_validator_model}
+      active_episode_limit: 4
+      attacker_permits: 2
+      shared_side_permits: 2
+      endpoint_quota_keys:
+        policy_model: policy-model-service
+        adaptive_attacker_model: swissai:research-account
+        adaptive_judge_model: swissai:research-account
+        adaptive_validator_model: swissai:research-account
+      policy_timeout_seconds: 120
+      side_timeout_seconds: 60
+      episode_timeout_seconds: 900
+      admission_timeout_seconds: 30
+      policy_context_limit_tokens: 15360
+      initial_prompt_limit_tokens: 4096
+      user_message_limit_tokens: 256
+      defender_output_limit_tokens: 1024
+      attacker_output_limit_tokens: 512
+      side_output_limit_tokens: 1024
+      require_native_tokenizer: true
+      stage_id: null
+      run_seed: 17017
+      asr_honeypot: false
+      honeypot_calibration_approved: false
