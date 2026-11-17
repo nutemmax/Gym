@@ -35,7 +35,9 @@ def test_context_exhaustion_preserves_completed_turns_without_scoring_another():
         sample_id="sample", rewards=[1.0, 0.5], details=[{"turn_idx": 1}, {"turn_idx": 2}],
         step=MagicMock(),
     )
-    server = SimpleNamespace(session_state={"session": episode})
+    server = SimpleNamespace(
+        session_state={"session": episode}, config=SimpleNamespace(max_total_sequence_length=32_768)
+    )
     result = asyncio.run(IFGymServer.step(
         server, action(status="incomplete", reason="max_output_tokens"), {}, "session"
     ))
@@ -49,7 +51,9 @@ def test_context_exhaustion_preserves_completed_turns_without_scoring_another():
 
 def test_first_turn_context_exhaustion_has_no_turn_rewards():
     episode = SimpleNamespace(sample_id="sample", rewards=[], details=[], step=MagicMock())
-    server = SimpleNamespace(session_state={"session": episode})
+    server = SimpleNamespace(
+        session_state={"session": episode}, config=SimpleNamespace(max_total_sequence_length=32_768)
+    )
     _, _, _, truncated, info = asyncio.run(IFGymServer.step(
         server, action(status="incomplete", reason="max_output_tokens", output_tokens=0), {}, "session"
     ))
@@ -59,7 +63,9 @@ def test_first_turn_context_exhaustion_has_no_turn_rewards():
 
 def test_generated_empty_answer_is_still_scored():
     episode = SimpleNamespace(step=MagicMock(return_value=(None, 0.0, True, {"turn_rewards": [0.0]})))
-    server = SimpleNamespace(session_state={"session": episode})
+    server = SimpleNamespace(
+        session_state={"session": episode}, config=SimpleNamespace(max_total_sequence_length=32_768)
+    )
     result = asyncio.run(IFGymServer.step(
         server, action(status="completed", output_tokens=1), {}, "session"
     ))
@@ -67,22 +73,69 @@ def test_generated_empty_answer_is_still_scored():
     episode.step.assert_called_once_with("")
 
 
-def test_empty_response_with_generated_tokens_at_output_cap_is_scored():
+def test_empty_response_with_generated_tokens_at_output_cap_is_scored_and_stops():
     episode = SimpleNamespace(step=MagicMock(return_value=(None, 0.0, True, {"turn_rewards": [0.0]})))
-    server = SimpleNamespace(session_state={"session": episode})
-    asyncio.run(IFGymServer.step(
+    server = SimpleNamespace(
+        session_state={"session": episode}, config=SimpleNamespace(max_total_sequence_length=32_768)
+    )
+    result = asyncio.run(IFGymServer.step(
         server, action(status="incomplete", reason="max_output_tokens", output_tokens=1), {}, "session"
     ))
+    assert result[0] is None and result[3]
+    assert result[4]["truncation_reason"] == "max_output_tokens"
     episode.step.assert_called_once_with("")
 
 
 def test_nonempty_response_at_output_cap_is_scored():
     episode = SimpleNamespace(step=MagicMock(return_value=(None, 1.0, True, {"turn_rewards": [1.0]})))
-    server = SimpleNamespace(session_state={"session": episode})
+    server = SimpleNamespace(
+        session_state={"session": episode}, config=SimpleNamespace(max_total_sequence_length=32_768)
+    )
     response = action(status="incomplete", reason="max_output_tokens", output_tokens=2048)
     response.output = [SimpleNamespace(type="message", content="answer")]
-    asyncio.run(IFGymServer.step(server, response, {}, "session"))
+    result = asyncio.run(IFGymServer.step(server, response, {}, "session"))
+    assert result[0] is None and result[1] == 1.0 and result[3]
+    assert result[4]["truncation_reason"] == "max_output_tokens"
     episode.step.assert_called_once_with("answer")
+
+
+@pytest.mark.parametrize("answer", ["", "partial reply"])
+def test_output_cap_preserves_current_score_and_stops_before_next_turn(answer):
+    episode = SimpleNamespace(
+        step=MagicMock(return_value=("next user prompt", 0.5, False, {"turn_rewards": [1.0, 0.5]}))
+    )
+    server = SimpleNamespace(
+        session_state={"session": episode}, config=SimpleNamespace(max_total_sequence_length=32_768)
+    )
+    response = action(status="incomplete", reason="max_output_tokens", input_tokens=100, output_tokens=2048)
+    response.output = [SimpleNamespace(type="message", content=answer)]
+
+    observation, reward, terminated, truncated, info = asyncio.run(
+        IFGymServer.step(server, response, {}, "session")
+    )
+
+    assert observation is None and reward == 0.5 and not terminated and truncated
+    assert info["turn_rewards"] == [1.0, 0.5]
+    assert info["truncation_reason"] == "max_output_tokens"
+    episode.step.assert_called_once_with(answer)
+    assert response.output[0].content == answer
+
+
+def test_completed_response_still_continues_to_next_turn():
+    episode = SimpleNamespace(
+        step=MagicMock(return_value=("next user prompt", 1.0, False, {"turn_rewards": [1.0]}))
+    )
+    server = SimpleNamespace(
+        session_state={"session": episode}, config=SimpleNamespace(max_total_sequence_length=32_768)
+    )
+    response = action(status="completed", input_tokens=100, output_tokens=25)
+    response.output = [SimpleNamespace(type="message", content="complete reply")]
+
+    result = asyncio.run(IFGymServer.step(server, response, {}, "session"))
+
+    assert result[:4] == ("next user prompt", 1.0, False, False)
+    assert "truncation_reason" not in result[4]
+    episode.step.assert_called_once_with("complete reply")
 
 
 @pytest.mark.parametrize("total_tokens", [32_768, 32_769])
@@ -90,7 +143,9 @@ def test_nonempty_response_reaching_sequence_limit_is_dropped(total_tokens):
     episode = SimpleNamespace(
         sample_id="sample", rewards=[1.0], details=[{"turn_idx": 1}], step=MagicMock()
     )
-    server = SimpleNamespace(session_state={"session": episode})
+    server = SimpleNamespace(
+        session_state={"session": episode}, config=SimpleNamespace(max_total_sequence_length=32_768)
+    )
     response = action(
         status="incomplete",
         reason="max_output_tokens",
@@ -112,7 +167,9 @@ def test_nonempty_response_reaching_sequence_limit_is_dropped(total_tokens):
 
 def test_nonempty_2048_token_completion_below_sequence_limit_is_scored():
     episode = SimpleNamespace(step=MagicMock(return_value=(None, 1.0, True, {"turn_rewards": [1.0]})))
-    server = SimpleNamespace(session_state={"session": episode})
+    server = SimpleNamespace(
+        session_state={"session": episode}, config=SimpleNamespace(max_total_sequence_length=32_768)
+    )
     response = action(
         status="incomplete", reason="max_output_tokens", input_tokens=30_719, output_tokens=2048
     )
@@ -120,13 +177,15 @@ def test_nonempty_2048_token_completion_below_sequence_limit_is_scored():
 
     result = asyncio.run(IFGymServer.step(server, response, {}, "session"))
 
-    assert result[1:4] == (1.0, True, False)
+    assert result[1:4] == (1.0, True, True)
     episode.step.assert_called_once_with("valid capped answer")
 
 
 def test_context_window_metadata_marks_prompt_overflow_before_output():
     episode = SimpleNamespace(sample_id="sample", rewards=[], details=[], step=MagicMock())
-    server = SimpleNamespace(session_state={"session": episode})
+    server = SimpleNamespace(
+        session_state={"session": episode}, config=SimpleNamespace(max_total_sequence_length=32_768)
+    )
     response = action(status="incomplete", reason="max_output_tokens", metadata={
         "nemo_gym_context_window_exceeded": "true",
     })

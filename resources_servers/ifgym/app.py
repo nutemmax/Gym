@@ -100,6 +100,9 @@ class IFGymServer(GymnasiumServer):
                 "truncation_reason": "context_exhausted",
             }
         observation, reward, terminated, info = episode.step(answer)
+        if action.status == "incomplete" and details is not None and details.reason == "max_output_tokens":
+            # Keep this turn's score and tokens, but never reuse an unfinished output as the next prompt.
+            return None, reward, terminated, True, {**info, "truncation_reason": "max_output_tokens"}
         return observation, reward, terminated, False, info
 
 

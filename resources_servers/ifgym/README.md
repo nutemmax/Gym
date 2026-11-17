@@ -18,6 +18,8 @@ The reward for each turn is the fraction of active checks that pass. A checker t
 
 When the model server reports context exhaustion without generating tokens, the server truncates the episode before scoring the nonexistent answer. It preserves completed turns and sets `info.truncation_reason` to `context_exhausted`. If no turn was generated, the agent flags the rollout for loss masking. The supplied agent configuration allows up to 10 turns; reaching that limit can also truncate an episode.
 
+When a response reaches its output token limit after generating tokens, the server scores that turn and retains its tokens, then ends the episode with `info.truncation_reason=max_output_tokens`. It does not send a subsequent user prompt: Apertus 2 continuation requires a complete burst ending in `<|wait|>`, which a capped response may lack. Completed responses continue normally.
+
 Session state is in memory, and `/step` does not deduplicate retried requests. A retry can therefore change episode state more than once. Account for this limitation when using request retries.
 
 ## Training integration
