@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from fastapi import FastAPI, Request
-from pydantic import PositiveInt, PrivateAttr
+from pydantic import Field, PositiveInt, PrivateAttr
 
 
 try:
@@ -33,7 +33,7 @@ from ifgym.instructions.instructions_registry import (
     history_instruction_kwargs,
 )
 from resources_servers.gymnasium import EnvResetRequest, EnvResetResponse, GymnasiumServer, extract_text
-from resources_servers.ifgym.episode import Episode, initial_user_text
+from resources_servers.ifgym.episode import EMPTY_ARTIFACT_SHA256, Episode, initial_user_text
 from resources_servers.ifgym.judge import JudgeAdapter, JudgeResult, UnresolvedGradeError
 
 
@@ -53,7 +53,11 @@ class IFGymResourcesServerConfig(BaseResourcesServerConfig):
     judge_enabled: bool = False
     judge_model_server: Optional[ModelServerRef] = None
     judge_max_concurrency: PositiveInt = 2
-    judge_timeout_seconds: PositiveInt = 30
+    judge_timeout_seconds: PositiveInt = Field(default=180, le=300)
+    judge_max_attempts: PositiveInt = Field(default=2, le=4)
+    expected_annotations_sha256: str = EMPTY_ARTIFACT_SHA256
+    expected_paraphrases_sha256: str = EMPTY_ARTIFACT_SHA256
+    paraphrases_path: Optional[str] = None
 
 
 class IFGymServer(GymnasiumServer):
@@ -127,7 +131,7 @@ class IFGymServer(GymnasiumServer):
         initial_prompt = episode["turns"][0].get("rendered_prompt")
         if initial_user_text(body.responses_create_params.model_dump(mode="json")) != initial_prompt:
             raise ValueError("initial user prompt does not match the episode")
-        candidate = Episode(episode)
+        candidate = self._build_episode(episode)
         if candidate.has_semantic_constraints:
             self._get_judge_adapter()
         old_session_id = request.session.get(SESSION_ID_KEY)
@@ -138,6 +142,14 @@ class IFGymServer(GymnasiumServer):
                 self.checkpoint_session_ended(request)
         request.session[SESSION_ID_KEY] = uuid.uuid4().hex
         return await super()._reset_endpoint(body, request)
+
+    def _build_episode(self, episode_data: dict) -> Episode:
+        return Episode(
+            episode_data,
+            expected_annotations_sha256=self.config.expected_annotations_sha256,
+            expected_paraphrases_sha256=self.config.expected_paraphrases_sha256,
+            paraphrases_path=self.config.paraphrases_path,
+        )
 
     def _get_judge_adapter(self) -> JudgeAdapter:
         if not getattr(self.config, "judge_enabled", False):
@@ -150,7 +162,8 @@ class IFGymServer(GymnasiumServer):
                 self.server_client,
                 model_server_name=model_ref.name,
                 max_concurrency=getattr(self.config, "judge_max_concurrency", 2),
-                timeout_seconds=getattr(self.config, "judge_timeout_seconds", 30),
+                timeout_seconds=getattr(self.config, "judge_timeout_seconds", 180),
+                max_attempts=getattr(self.config, "judge_max_attempts", 2),
             )
         return self._judge_adapter
 
@@ -160,7 +173,7 @@ class IFGymServer(GymnasiumServer):
         episode_data = metadata.get("episode")
         if not isinstance(episode_data, dict):
             raise ValueError("episode metadata is required")
-        episode = Episode(episode_data)
+        episode = self._build_episode(episode_data)
         if episode.has_semantic_constraints:
             self._get_judge_adapter()
         had_session = session_id in self.session_state
@@ -194,7 +207,6 @@ class IFGymServer(GymnasiumServer):
         return copy.deepcopy(response)
 
     async def _score_semantic_constraints(self, episode: Episode, turn: dict, response: str) -> dict[str, JudgeResult]:
-        adapter = self._get_judge_adapter()
         contexts = {}
         for constraint in turn["active_constraints"]:
             cid = constraint["constraint_id"]
@@ -278,6 +290,7 @@ class IFGymServer(GymnasiumServer):
             }
         if not contexts:
             return {}
+        adapter = self._get_judge_adapter()
         tasks = {handle: asyncio.create_task(adapter.score(context)) for handle, context in contexts.items()}
         try:
             await asyncio.gather(*tasks.values())

@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -16,7 +15,11 @@ if sys.version_info < (3, 13):
     pytest.skip("NeMo Gym requires Python 3.13", allow_module_level=True)
 
 import httpx
-from ifgym.instructions.instructions_registry import INSTRUCTION_DICT, get_instruction_metadata
+from ifgym.instructions.instructions_registry import (
+    INSTRUCTION_DICT,
+    get_instruction_metadata,
+    get_registry_revision,
+)
 
 
 try:
@@ -30,6 +33,7 @@ except ImportError:
 
 from resources_servers.gymnasium import EnvResetRequest, EnvStepRequest
 from resources_servers.ifgym.app import IFGymResourcesServerConfig, IFGymServer
+from resources_servers.ifgym.episode import EMPTY_ARTIFACT_SHA256
 from resources_servers.ifgym.judge import JudgeResult, UnresolvedGradeError
 
 
@@ -53,9 +57,9 @@ def semantic_row(*, one_turn=False):
     shown = INSTRUCTION_DICT[SEMANTIC_ID](SEMANTIC_ID).build_description()
     episode["metadata"]["non_verifiable"] = {
         "schema_version": 1,
-        "registry_revision": "test",
-        "annotations_sha256": hashlib.sha256(b"annotations").hexdigest(),
-        "paraphrases_sha256": hashlib.sha256(b"paraphrases").hexdigest(),
+        "registry_revision": get_registry_revision(),
+        "annotations_sha256": EMPTY_ARTIFACT_SHA256,
+        "paraphrases_sha256": EMPTY_ARTIFACT_SHA256,
         "constraints_by_handle": {
             handle: {
                 "constraint_id": SEMANTIC_ID,
@@ -67,6 +71,8 @@ def semantic_row(*, one_turn=False):
             }
         },
     }
+    episode["turns"][0]["rendered_prompt"] += " " + shown
+    episode["turns"][0]["rendered_constraints"] = [{"constraint_id": SEMANTIC_ID, "text": shown}]
     row["responses_create_params"]["input"] = [{"role": "user", "content": episode["turns"][0]["rendered_prompt"]}]
     return row, handle
 
@@ -121,14 +127,14 @@ class GateJudge:
         return JudgeResult("pass", 1, {"request_sha256": "unit-digest"})
 
 
-def make_server(*, gate=False, error=None):
+def make_server(*, gate=False, error=None, judge_enabled=True):
     config = IFGymResourcesServerConfig(
         host="",
         port=0,
         entrypoint="app.py",
         name="ifgym_resources_server",
         max_total_sequence_length=32768,
-        judge_enabled=True,
+        judge_enabled=judge_enabled,
         judge_model_server=ModelServerRef(type="responses_api_models", name="ifgym_judge_model"),
     )
     server = IFGymServer(config=config, server_client=MagicMock(spec=ServerClient))
@@ -369,5 +375,22 @@ def test_deterministic_episode_does_not_call_judge_when_semantic_mode_enabled():
             "deterministic-session",
         )
         assert judge.calls == 0
+
+    asyncio.run(run())
+
+
+def test_deterministic_episode_steps_when_judging_is_disabled():
+    async def run():
+        row = json.loads(DATA.read_text().splitlines()[0])
+        server, judge = make_server(judge_enabled=False)
+        await server.reset({"episode": row["episode"]}, "deterministic-disabled")
+        result = await server.step(
+            model_response("This response follows the requested instruction."),
+            {},
+            "deterministic-disabled",
+        )
+        assert result[1] >= 0
+        assert judge.calls == 0
+        assert server.session_state["deterministic-disabled"].index == 1
 
     asyncio.run(run())

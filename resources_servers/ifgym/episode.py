@@ -6,16 +6,27 @@
 from __future__ import annotations
 
 from hashlib import sha256
+from pathlib import Path
 from typing import Mapping
 from uuid import uuid4
 
-from ifgym.data.conversation import ConversationInternalRepr
+from ifgym.data.conversation import ConversationInternalRepr, _rule_from_dict
 from ifgym.instructions.instructions_registry import (
     INSTRUCTION_DICT,
     get_instruction_metadata,
+    get_registry_revision,
     history_instruction_kwargs,
 )
+from ifgym.templates.activation_rules import ThisTurnOnly, UntilRevoked
+from ifgym.templates.phrasing import PhrasingsRegistry
+from ifgym.templates.single_turn_rules import (
+    _capitalize_first_word_if_safe,
+    _lowercase_first_word_if_safe,
+)
 from resources_servers.ifgym.judge import JudgeResult, UnresolvedGradeError
+
+
+EMPTY_ARTIFACT_SHA256 = sha256(b"").hexdigest()
 
 
 def initial_user_text(params: dict) -> str:
@@ -32,7 +43,14 @@ def initial_user_text(params: dict) -> str:
 
 
 class Episode:
-    def __init__(self, data: dict):
+    def __init__(
+        self,
+        data: dict,
+        *,
+        expected_annotations_sha256: str = EMPTY_ARTIFACT_SHA256,
+        expected_paraphrases_sha256: str = EMPTY_ARTIFACT_SHA256,
+        paraphrases_path: str | None = None,
+    ):
         if not isinstance(data, dict):
             raise ValueError("episode must be an IFGym conversation object")
         conversation = ConversationInternalRepr.from_dict(data)
@@ -68,6 +86,17 @@ class Episode:
         self.instance_id = uuid4().hex
         self.sample_id = conversation.sample_id
         self.metadata = dict(conversation.metadata or {})
+        self.expected_annotations_sha256 = expected_annotations_sha256
+        self.expected_paraphrases_sha256 = expected_paraphrases_sha256
+        self._phrasing_registry = None
+        if paraphrases_path is not None:
+            raw_phrasings = Path(paraphrases_path).read_bytes()
+            actual_hash = sha256(raw_phrasings).hexdigest()
+            if actual_hash != expected_paraphrases_sha256:
+                raise ValueError("configured paraphrase artifact hash does not match its file")
+            self._phrasing_registry = PhrasingsRegistry(paraphrases_path)
+        elif expected_paraphrases_sha256 != EMPTY_ARTIFACT_SHA256:
+            raise ValueError("non-empty paraphrase provenance requires a configured paraphrases_path")
         self._semantic_by_handle = self._validate_semantic_contract(data)
         self.turns = views
         self.responses: list[str] = []
@@ -155,6 +184,31 @@ class Episode:
         if last_update["preference_text"] != binding["preference_text"] or last_update["scope"] != binding["scope"]:
             raise ValueError(f"preference binding for {handle!r} does not match its latest update")
 
+    def _allowed_introduction_wordings(self, event: dict) -> dict[str, set[str]]:
+        cid = event["constraint_id"]
+        kwargs = dict(event.get("kwargs") or {})
+        checker_kwargs = dict(kwargs)
+        checker_kwargs.update(history_instruction_kwargs(cid, None, []))
+        canonical = INSTRUCTION_DICT[cid](cid).build_description(**checker_kwargs)
+        phrases = {canonical}
+        if self._phrasing_registry is not None:
+            entry = self._phrasing_registry.get_entry(cid)
+            phrasing_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"prompt_to_repeat", "previous_response", "previous_responses"}
+            }
+            if entry is not None and entry.strategy != "dynamic" and set(entry.kwargs_schema) == set(phrasing_kwargs):
+                phrases.update(template.format(**phrasing_kwargs) for template in entry.phrasings)
+
+        rule = _rule_from_dict(event["rule"])
+        if isinstance(rule, (ThisTurnOnly, UntilRevoked)):
+            return {phrase: {phrase} for phrase in phrases}
+        prefix = rule.describe().strip()
+        if not prefix:
+            return {phrase: {phrase} for phrase in phrases}
+        return {f"{prefix} {_lowercase_first_word_if_safe(phrase)}": {phrase} for phrase in phrases}
+
     def _validate_semantic_contract(self, episode_data: dict) -> dict[str, dict]:
         has_semantic = any(
             event.get("type") == "introduce"
@@ -168,9 +222,14 @@ class Episode:
         contract = self.metadata.get("non_verifiable")
         if not isinstance(contract, dict) or contract.get("schema_version") != 1:
             raise ValueError("semantic episode requires non_verifiable metadata schema_version 1")
-        for key in ("registry_revision", "annotations_sha256", "paraphrases_sha256"):
-            if not isinstance(contract.get(key), str) or not contract[key]:
-                raise ValueError(f"semantic metadata requires {key}")
+        expected_provenance = {
+            "registry_revision": get_registry_revision(),
+            "annotations_sha256": self.expected_annotations_sha256,
+            "paraphrases_sha256": self.expected_paraphrases_sha256,
+        }
+        for key, expected in expected_provenance.items():
+            if contract.get(key) != expected:
+                raise ValueError(f"semantic metadata {key} does not match trusted runtime provenance")
         rows = contract.get("constraints_by_handle")
         if not isinstance(rows, dict):
             raise ValueError("semantic episode requires constraints_by_handle metadata")
@@ -192,8 +251,26 @@ class Episode:
                 expected_hash = meta.rubric_sha256
                 if row.get("rubric_sha256") != expected_hash:
                     raise ValueError(f"semantic rubric hash is mismatched for handle {handle!r}")
-                if not isinstance(row.get("instruction_as_shown"), str) or not row["instruction_as_shown"].strip():
-                    raise ValueError(f"semantic introduction wording is missing for handle {handle!r}")
+                shown = row.get("instruction_as_shown")
+                allowed_wordings = self._allowed_introduction_wordings(event)
+                base_phrases = allowed_wordings.get(shown) if isinstance(shown, str) else None
+                prompt = turn.get("rendered_prompt", "")
+                rendered_constraints = turn.get("rendered_constraints", [])
+                if (
+                    not isinstance(shown, str)
+                    or not shown.strip()
+                    or not base_phrases
+                    or not any(
+                        isinstance(rendered, dict)
+                        and rendered.get("constraint_id") == cid
+                        and rendered.get("text") in base_phrases
+                        for rendered in rendered_constraints
+                    )
+                    or not any(visible in prompt for visible in {shown, _lowercase_first_word_if_safe(shown), _capitalize_first_word_if_safe(shown), _capitalize_first_word_if_safe(_lowercase_first_word_if_safe(shown))})
+                ):
+                    raise ValueError(
+                        f"semantic introduction wording for handle {handle!r} does not match its rendered registered template"
+                    )
                 if row.get("introduced_at") != turn.get("turn_idx"):
                     raise ValueError(f"semantic introduction turn is mismatched for handle {handle!r}")
                 if cid == "history:respect_prior_user_preference":

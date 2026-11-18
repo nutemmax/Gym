@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -139,6 +140,18 @@ def chat_request(context: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+
+def _retry_delay(base_delay: float, retry_after: Any = None) -> float:
+    if retry_after is not None:
+        try:
+            requested = float(retry_after)
+            if requested >= 0:
+                return min(requested, 30.0)
+        except (TypeError, ValueError):
+            pass
+    return base_delay + random.uniform(0.0, min(0.25 * base_delay, 1.0))
+
+
 class JudgeAdapter:
     """Call the NeMo Gym model server with bounded retries and successful-grade caching."""
 
@@ -151,8 +164,14 @@ class JudgeAdapter:
         timeout_seconds: float = 30.0,
         cache_entries: int = 0,
         model_identity: str | None = None,
+        max_attempts: int = 2,
     ) -> None:
-        if max_concurrency < 1 or timeout_seconds <= 0 or not 0 <= cache_entries <= MAX_JUDGE_CACHE_ENTRIES:
+        if (
+            max_concurrency < 1
+            or timeout_seconds <= 0
+            or not 1 <= max_attempts <= 4
+            or not 0 <= cache_entries <= MAX_JUDGE_CACHE_ENTRIES
+        ):
             raise ValueError("judge concurrency, timeout, and cache size are invalid")
         if cache_entries and not model_identity:
             raise ValueError("judge result caching requires an immutable model identity")
@@ -160,10 +179,10 @@ class JudgeAdapter:
         self.model_server_name = model_server_name
         self.semaphore = asyncio.Semaphore(max_concurrency)
         self.timeout_seconds = timeout_seconds
+        self.max_attempts = max_attempts
         self.cache_entries = cache_entries
         self.model_identity = model_identity
         self._cache: OrderedDict[str, JudgeResult] = OrderedDict()
-        self._pending: dict[str, asyncio.Future[JudgeResult]] = {}
         self._cache_lock = asyncio.Lock()
 
     @staticmethod
@@ -192,47 +211,21 @@ class JudgeAdapter:
                         separators=(",", ":"),
                     ).encode("utf-8")
                 ).hexdigest()
-                async with self._cache_lock:
-                    cached = self._cache.get(request_hash)
-                    if cached is not None:
-                        self._cache.move_to_end(request_hash)
-                        return self._with_cache_status(cached, True)
-                    future = self._pending.get(request_hash)
-                    owner = future is None
-                    if future is None:
-                        future = loop.create_future()
-                        self._pending[request_hash] = future
-                if not owner:
-                    result = await asyncio.shield(future)
-                    if loop.time() > deadline:
-                        raise TimeoutError("judge cache wait exceeded deadline")
-                    return self._with_cache_status(result, True)
-
-                try:
-                    result = await self._request(request, request_hash, deadline, loop)
+                if self.cache_entries:
                     async with self._cache_lock:
-                        if self.cache_entries:
-                            self._cache[request_hash] = result
+                        cached = self._cache.get(request_hash)
+                        if cached is not None:
                             self._cache.move_to_end(request_hash)
-                            while len(self._cache) > self.cache_entries:
-                                self._cache.popitem(last=False)
-                        self._pending.pop(request_hash, None)
-                        if not future.done():
-                            future.set_result(result)
-                    return self._with_cache_status(result, False)
-                except asyncio.CancelledError:
+                            return self._with_cache_status(cached, True)
+
+                result = await self._request(request, request_hash, deadline, loop)
+                if self.cache_entries:
                     async with self._cache_lock:
-                        self._pending.pop(request_hash, None)
-                        if not future.done():
-                            future.cancel()
-                    raise
-                except BaseException as error:
-                    async with self._cache_lock:
-                        self._pending.pop(request_hash, None)
-                        if not future.done():
-                            future.set_exception(error)
-                            future.exception()
-                    raise
+                        self._cache[request_hash] = result
+                        self._cache.move_to_end(request_hash)
+                        while len(self._cache) > self.cache_entries:
+                            self._cache.popitem(last=False)
+                return self._with_cache_status(result, False)
         except UnresolvedGradeError:
             raise
         except TimeoutError as error:
@@ -247,7 +240,8 @@ class JudgeAdapter:
         deadline: float,
         loop: asyncio.AbstractEventLoop,
     ) -> JudgeResult:
-        for attempt in (1, 2):
+        for attempt in range(1, self.max_attempts + 1):
+            retry_after = None
             try:
                 async with self.semaphore:
                     response = await self.server_client.post(
@@ -284,16 +278,24 @@ class JudgeAdapter:
                     "invalid_json",
                     "invalid_schema",
                     "invalid_verdict",
-                    "transport_error",
                 }
-                if not retryable or attempt == 2:
+                if not retryable or attempt == self.max_attempts:
                     raise
             except TimeoutError:
-                raise
+                if loop.time() >= deadline or attempt == self.max_attempts:
+                    raise
             except Exception as error:
                 status = getattr(error, "status", getattr(error, "status_code", None))
                 if status is not None and status != 429 and status < 500:
                     raise UnresolvedGradeError("upstream_rejected", "judge server rejected the request") from error
-                if attempt == 2:
+                if attempt == self.max_attempts:
                     raise UnresolvedGradeError("transport_error", "judge request failed") from error
+                headers = getattr(error, "headers", None)
+                if headers is not None:
+                    retry_after = headers.get("Retry-After") or headers.get("retry-after")
+            base_delay = min(2 ** (attempt - 1), 4)
+            delay = _retry_delay(base_delay, retry_after)
+            if loop.time() + delay >= deadline:
+                raise UnresolvedGradeError("timeout", "judge retry would exceed its deadline")
+            await asyncio.sleep(delay)
         raise UnresolvedGradeError("transport_error", "judge request failed after bounded recovery")

@@ -140,19 +140,64 @@ def test_adapter_retries_invalid_output_once(monkeypatch):
     assert observed == {"calls": 2, "transport_attempts": 1}
 
 
-def test_identical_inflight_request_coalesces_without_coupling_cancellation(monkeypatch):
+def test_retry_budget_and_backoff_are_configurable(monkeypatch):
+    from resources_servers.ifgym import judge
+
+    observed = {"calls": 0, "delays": []}
+
+    class FakeClient:
+        async def post(self, **_kwargs):
+            observed["calls"] += 1
+            return object()
+
+    async def run():
+        async def status(_response):
+            return None
+
+        async def get_json(_response):
+            if observed["calls"] < 4:
+                return completion("not json")
+            return completion('{"verdict":"pass"}')
+
+        async def sleep(delay):
+            observed["delays"].append(delay)
+
+        monkeypatch.setattr(judge, "_raise_for_status", status)
+        monkeypatch.setattr(judge, "_get_response_json", get_json)
+        monkeypatch.setattr(judge.asyncio, "sleep", sleep)
+        monkeypatch.setattr(judge.random, "uniform", lambda _low, _high: 0.0)
+        result = await JudgeAdapter(FakeClient(), max_attempts=4).score({"target": "rubric"})
+        assert result.provenance["attempts"] == "4"
+
+    asyncio.run(run())
+    assert observed == {"calls": 4, "delays": [1, 2, 4]}
+
+
+def test_retry_after_is_bounded_and_preferred():
+    from resources_servers.ifgym.judge import _retry_delay
+
+    assert _retry_delay(1, "2.5") == 2.5
+    assert _retry_delay(1, "999") == 30.0
+    assert _retry_delay(1, "invalid") >= 1
+
+
+def test_identical_inflight_requests_do_not_share_cancellation(monkeypatch):
     from resources_servers.ifgym import judge
 
     observed = {"calls": 0}
 
     class SlowClient:
         def __init__(self):
-            self.entered = asyncio.Event()
+            self.first_entered = asyncio.Event()
+            self.both_entered = asyncio.Event()
             self.release = asyncio.Event()
 
         async def post(self, **_kwargs):
             observed["calls"] += 1
-            self.entered.set()
+            if observed["calls"] == 1:
+                self.first_entered.set()
+            if observed["calls"] == 2:
+                self.both_entered.set()
             await self.release.wait()
             return object()
 
@@ -168,20 +213,20 @@ def test_identical_inflight_request_coalesces_without_coupling_cancellation(monk
         client = SlowClient()
         adapter = JudgeAdapter(client)
         context = {"target": "same"}
-        owner = asyncio.create_task(adapter.score(context))
-        await client.entered.wait()
-        waiter = asyncio.create_task(adapter.score(context))
-        await asyncio.sleep(0)
-        waiter.cancel()
+        canceled = asyncio.create_task(adapter.score(context))
+        await client.first_entered.wait()
+        survivor = asyncio.create_task(adapter.score(context))
+        await client.both_entered.wait()
+        canceled.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await waiter
+            await canceled
         client.release.set()
-        result = await owner
+        result = await survivor
         assert result.score == 1
         assert result.provenance["cache_hit"] == "false"
 
     asyncio.run(run())
-    assert observed["calls"] == 1
+    assert observed["calls"] == 2
 
 
 def test_success_cache_requires_explicit_model_identity(monkeypatch):
