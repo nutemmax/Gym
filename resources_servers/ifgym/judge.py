@@ -157,7 +157,7 @@ def _retry_delay(base_delay: float, retry_after: Any = None) -> float:
             except (TypeError, ValueError, OverflowError):
                 requested = -1
         if requested >= 0:
-            return min(requested, 30.0)
+            return requested
     return base_delay + random.uniform(0.0, min(0.25 * base_delay, 1.0))
 
 

@@ -346,11 +346,44 @@ def test_native_provider_status_reaches_judge_adapter(provider_status, expected_
     asyncio.run(run())
 
 
+
+def test_retry_after_beyond_deadline_is_not_clipped_into_early_retry(monkeypatch):
+    from resources_servers.ifgym import judge
+
+    class UpstreamError(Exception):
+        status = 429
+        headers = {"Retry-After": "60"}
+
+    class FakeClient:
+        calls = 0
+
+        async def post(self, **_kwargs):
+            self.calls += 1
+            raise UpstreamError()
+
+    client = FakeClient()
+    delays = []
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    async def run():
+        monkeypatch.setattr(judge.asyncio, "sleep", sleep)
+        with pytest.raises(UnresolvedGradeError) as raised:
+            await JudgeAdapter(client, max_attempts=4, timeout_seconds=30).score({"target": "rubric"})
+        assert raised.value.code == "timeout"
+
+    asyncio.run(run())
+    assert client.calls == 1
+    assert delays == []
+
 def test_retry_after_is_bounded_and_preferred():
     from resources_servers.ifgym.judge import _retry_delay
 
     assert _retry_delay(1, "2.5") == 2.5
-    assert _retry_delay(1, "999") == 30.0
+    assert _retry_delay(1, "60") == 60.0
+    assert _retry_delay(1, "120") == 120.0
+    assert _retry_delay(1, "999") == 999.0
     assert _retry_delay(1, "Wed, 21 Oct 2037 07:28:00 GMT") > 1
     assert _retry_delay(1, "invalid") >= 1
 
