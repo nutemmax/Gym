@@ -132,6 +132,7 @@ class AdaptiveSafetyAgent(SimpleResponsesAPIAgent):
     async def _post_model(
         self, server_name: str, payload: dict[str, Any], *, timeout: float, token_capture: bool = False,
         run_body: object | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         path = "/v1/responses"
         if token_capture and run_body is not None:
@@ -143,6 +144,7 @@ class AdaptiveSafetyAgent(SimpleResponsesAPIAgent):
             timeout=timeout,
             _max_num_tries=1,
             _resend_after_disconnect=False,
+            **({"headers": {"X-Request-Id": request_id}} if request_id else {}),
         )
         await raise_for_status(response)
         raw = await get_response_json(response)
@@ -198,7 +200,11 @@ class AdaptiveSafetyAgent(SimpleResponsesAPIAgent):
         self, server_name: str, prompt: str, envelope: Mapping[str, Any], *,
         schema: type[BaseModel] | None = None, seed: int | None = None,
         call_metrics: list[dict[str, Any]] | None = None,
+        request_id: str | None = None,
+        max_attempts: int = 2,
     ) -> dict[str, Any]:
+        if not 1 <= max_attempts <= 2:
+            raise ValueError("side-call attempts must be one or two")
         payload = {
             "input": [
                 {"role": "system", "content": prompt},
@@ -214,15 +220,21 @@ class AdaptiveSafetyAgent(SimpleResponsesAPIAgent):
             "text": {"format": {"type": "json_object"}},
             "store": False,
         }
+        if request_id:
+            payload["metadata"] = {"adaptive_request_id": request_id}
         if server_name == self.config.attacker_model_server.name:
             payload["top_p"] = 0.95
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         async with self._endpoint_semaphore(server_name):
             started = perf_counter()
             token_totals = {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0}
-            for attempt in range(2):
+            for attempt in range(max_attempts):
                 try:
                     response = await asyncio.wait_for(
-                        self._post_model(server_name, payload, timeout=self.config.side_timeout_seconds),
+                        self._post_model(
+                            server_name, payload, timeout=self.config.side_timeout_seconds,
+                            request_id=request_id,
+                        ),
                         timeout=self.config.side_timeout_seconds,
                     )
                     usage = response.get("usage") if isinstance(response.get("usage"), Mapping) else {}
@@ -253,12 +265,12 @@ class AdaptiveSafetyAgent(SimpleResponsesAPIAgent):
                         })
                     return parsed
                 except (TimeoutError, ValueError, json.JSONDecodeError):
-                    if attempt:
+                    if attempt + 1 >= max_attempts:
                         if call_metrics is not None:
                             call_metrics.append({
                                 "role": self._role_name(server_name), "alias": server_name,
                                 "latency_seconds": round(perf_counter() - started, 3),
-                                "attempts": 2, "seed": payload.get("seed"), "failed": True, **token_totals,
+                                "attempts": max_attempts, "seed": payload.get("seed"), "failed": True, **token_totals,
                             })
                         raise
                     payload["input"].append({"role": "user", "content": "Return one complete JSON object matching the requested schema. Do not add any other text."})
@@ -271,7 +283,7 @@ class AdaptiveSafetyAgent(SimpleResponsesAPIAgent):
                             "failed": True, **token_totals,
                         })
                     raise
-        raise AssertionError("bounded side retry fell through")
+        raise AssertionError("bounded side call fell through")
 
     @staticmethod
     def _usage_totals(value: object) -> dict[str, int]:
