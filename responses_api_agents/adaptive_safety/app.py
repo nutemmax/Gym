@@ -905,3 +905,7 @@ class AdaptiveSafetyAgent(SimpleResponsesAPIAgent):
         payload = body.model_dump(mode="json", exclude_none=True)
         result = await self._policy_call(payload, body)
         return NeMoGymResponse.model_validate(result)
+
+
+if __name__ == "__main__":
+    AdaptiveSafetyAgent.run_webserver()
