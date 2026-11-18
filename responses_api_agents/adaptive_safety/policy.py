@@ -218,8 +218,11 @@ def visible_text(items: Sequence[Mapping[str, object]]) -> str:
             continue
         content = item.get("content")
         for segment in content if isinstance(content, list) else []:
-            if isinstance(segment, Mapping) and segment.get("type") in ("output_text", "text") and isinstance(segment.get("text"), str):
-                parts.append(segment["text"])
+            if not isinstance(segment, Mapping):
+                continue
+            text = segment.get("text") if segment.get("type") in ("output_text", "text") else segment.get("refusal") if segment.get("type") == "refusal" else None
+            if isinstance(text, str):
+                parts.append(text)
     return "\n".join(parts)
 
 def visible_history(items: Sequence[Mapping[str, object]]) -> list[dict[str, str]]:
@@ -237,7 +240,7 @@ def visible_history(items: Sequence[Mapping[str, object]]) -> list[dict[str, str
             for part in content:
                 if not isinstance(part, Mapping):
                     continue
-                value = part.get("text")
+                value = part.get("refusal") if part.get("type") == "refusal" else part.get("text")
                 if isinstance(value, str) and part.get("type") in ("input_text", "output_text", "text", "refusal"):
                     parts.append(value)
             text = "\n".join(parts)
