@@ -14,7 +14,7 @@ adaptive_safety_agent:
         policy_model: policy-model-service
         adaptive_attacker_model: swissai:research-account
         adaptive_judge_model: sml:judge-service
-        adaptive_validator_model: swissai:research-account
+        adaptive_validator_model: sml:judge-service
       policy_timeout_seconds: 120
       side_timeout_seconds: 60
       side_total_timeout_seconds: 300
