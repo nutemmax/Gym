@@ -3,7 +3,13 @@
 
 import asyncio
 
+import httpx
 import pytest
+from aiohttp import ClientResponseError, RequestInfo
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from multidict import CIMultiDict, CIMultiDictProxy
+from yarl import URL
 
 from resources_servers.ifgym.judge import (
     JudgeAdapter,
@@ -171,6 +177,173 @@ def test_retry_budget_and_backoff_are_configurable(monkeypatch):
 
     asyncio.run(run())
     assert observed == {"calls": 4, "delays": [1, 2, 4]}
+
+
+def test_provider_retry_status_uses_native_wrapper_marker_and_retry_after(monkeypatch):
+    from resources_servers.ifgym import judge
+
+    observed = {"calls": 0, "delays": [], "requests": []}
+
+    class UpstreamError(Exception):
+        def __init__(self, status, headers=None):
+            self.status = status
+            self.headers = headers or {}
+
+    class FakeClient:
+        async def post(self, **kwargs):
+            observed["calls"] += 1
+            observed["requests"].append(kwargs)
+            if observed["calls"] == 1:
+                raise UpstreamError(429, {"Retry-After": "2"})
+            return object()
+
+    async def run():
+        async def status(_response):
+            return None
+
+        async def get_json(_response):
+            return completion('{"verdict":"pass"}')
+
+        async def sleep(delay):
+            observed["delays"].append(delay)
+
+        monkeypatch.setattr(judge, "_raise_for_status", status)
+        monkeypatch.setattr(judge, "_get_response_json", get_json)
+        monkeypatch.setattr(judge.asyncio, "sleep", sleep)
+        result = await JudgeAdapter(FakeClient(), max_attempts=4).score({"target": "rubric"})
+        assert result.verdict == "pass"
+        assert result.provenance["attempts"] == "2"
+
+    asyncio.run(run())
+    assert observed["calls"] == 2
+    assert observed["delays"] == [2.0]
+    assert all(request["headers"] == {judge.JUDGE_PROVIDER_ERROR_HEADER: "1"} for request in observed["requests"])
+    assert all(request["_max_attempts"] == 1 for request in observed["requests"])
+
+
+def test_permanent_provider_4xx_is_not_retried(monkeypatch):
+    from resources_servers.ifgym import judge
+
+    class UpstreamError(Exception):
+        status = 400
+        headers = {"Retry-After": "30"}
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def post(self, **_kwargs):
+            self.calls += 1
+            raise UpstreamError()
+
+    client = FakeClient()
+
+    async def run():
+        with pytest.raises(UnresolvedGradeError) as raised:
+            await JudgeAdapter(client, max_attempts=4).score({"target": "rubric"})
+        assert raised.value.code == "upstream_rejected"
+
+    asyncio.run(run())
+    assert client.calls == 1
+
+
+@pytest.mark.parametrize(("provider_status", "expected_calls"), [(429, 2), (400, 1)])
+def test_native_provider_status_reaches_judge_adapter(provider_status, expected_calls, monkeypatch):
+    from resources_servers.ifgym import judge
+
+    try:
+        from nemo_gym.server_runtime.base_server import SimpleServer
+    except ImportError:
+        from nemo_gym.server_utils import SimpleServer
+
+    provider_calls = {"count": 0, "headers": []}
+    request_info = RequestInfo(
+        url=URL("https://api.example.test/v1/chat/completions"),
+        method="POST",
+        headers=CIMultiDictProxy(CIMultiDict()),
+        real_url=URL("https://api.example.test/v1/chat/completions"),
+    )
+    app = FastAPI()
+    server = type(
+        "TestServer",
+        (),
+        {"get_session_middleware_key": lambda _self: "test-provider-server"},
+    )()
+    SimpleServer.setup_exception_middleware(server, app)
+
+    @app.post("/v1/chat/completions")
+    async def provider_route(request: Request):
+        provider_calls["count"] += 1
+        provider_calls["headers"].append(request.headers.get(judge.JUDGE_PROVIDER_ERROR_HEADER))
+        if provider_calls["count"] == 1:
+            error = ClientResponseError(
+                request_info=request_info,
+                history=(),
+                status=provider_status,
+                message="provider rejected request",
+                headers=CIMultiDictProxy(CIMultiDict({"Retry-After": "30"})),
+            )
+            error.response_content = b"provider response"
+            raise error
+        return JSONResponse(completion('{"verdict":"pass"}'))
+
+    class ProviderStatusError(Exception):
+        def __init__(self, status, headers):
+            self.status = status
+            self.headers = headers
+
+    class NativeWrapperClient:
+        def __init__(self, client):
+            self.client = client
+            self.calls = 0
+
+        async def post(self, **kwargs):
+            self.calls += 1
+            response = await self.client.post(
+                kwargs["url_path"],
+                json=kwargs["json"],
+                headers=kwargs["headers"],
+            )
+            if response.status_code >= 400:
+                headers = {"Retry-After": response.headers["retry-after"]} if "retry-after" in response.headers else {}
+                raise ProviderStatusError(response.status_code, headers)
+            return response
+
+    async def run():
+        delays = []
+
+        async def no_raise(_response):
+            return None
+
+        async def response_json(response):
+            return response.json()
+
+        async def sleep(delay):
+            delays.append(delay)
+
+        monkeypatch.setattr(judge, "_raise_for_status", no_raise)
+        monkeypatch.setattr(judge, "_get_response_json", response_json)
+        monkeypatch.setattr(judge.asyncio, "sleep", sleep)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://native-modelserver",
+        ) as http_client:
+            native_client = NativeWrapperClient(http_client)
+            adapter = JudgeAdapter(native_client, max_attempts=4, timeout_seconds=180)
+            if provider_status == 429:
+                result = await adapter.score({"target": "rubric"})
+                assert result.verdict == "pass"
+                assert delays == [30.0]
+            else:
+                with pytest.raises(UnresolvedGradeError) as raised:
+                    await adapter.score({"target": "rubric"})
+                assert raised.value.code == "upstream_rejected"
+                assert delays == []
+            assert native_client.calls == expected_calls
+            assert provider_calls["count"] == expected_calls
+            assert provider_calls["headers"] == ["1"] * expected_calls
+
+    asyncio.run(run())
 
 
 def test_retry_after_is_bounded_and_preferred():

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+from ifgym.instructions.non_verifiable import get_approved_phrasing_templates
 from ifgym.instructions.instructions_registry import INSTRUCTION_DICT, get_instruction_metadata, get_registry_revision
 
 from resources_servers.ifgym.episode import EMPTY_ARTIFACT_SHA256, Episode
@@ -150,11 +151,11 @@ def test_semantic_contract_rejects_untrusted_registry_hashes_and_wording():
 
 def test_configured_paraphrase_is_hash_checked_and_accepted(tmp_path):
     row, handle = semantic_episode()
-    phrasing = "A professional and respectful style is required."
+    phrasing = get_approved_phrasing_templates("nonverifiable:professional_tone")[1]
     paraphrases = {
         "constraints": {
             "nonverifiable:professional_tone": {
-                "strategy": "static",
+                "strategy": "templated",
                 "kwargs_schema": [],
                 "phrasings": [phrasing],
             }
@@ -172,6 +173,31 @@ def test_configured_paraphrase_is_hash_checked_and_accepted(tmp_path):
 
     with pytest.raises(ValueError, match="paraphrase artifact hash"):
         Episode(row, expected_paraphrases_sha256=EMPTY_ARTIFACT_SHA256, paraphrases_path=str(path))
+
+
+def test_registered_paraphrase_is_accepted_without_external_artifact():
+    row, handle = semantic_episode()
+    cid = "nonverifiable:professional_tone"
+    phrasing = get_approved_phrasing_templates(cid)[1]
+    row["metadata"]["non_verifiable"]["constraints_by_handle"][handle]["instruction_as_shown"] = phrasing
+    row["turns"][0]["rendered_prompt"] += " " + phrasing
+    row["turns"][0]["rendered_constraints"] = [{"constraint_id": cid, "text": phrasing}]
+    Episode(row)
+
+
+def test_homonym_approved_templates_are_formatted_from_event_arguments():
+    episode = Episode.__new__(Episode)
+    episode._phrasing_registry = None
+    event = {
+        "constraint_id": "nonverifiable:homonym_two_senses",
+        "kwargs": {"word": "bank"},
+        "rule": {"type": "until_revoked"},
+    }
+    allowed = episode._allowed_introduction_wordings(event)
+    templates = get_approved_phrasing_templates(event["constraint_id"])
+    assert templates
+    assert all(template.format(word="bank") in allowed for template in templates)
+    assert all("{word}" not in wording for wording in allowed)
 
 
 def test_history_preference_without_binding_fails_closed():

@@ -17,6 +17,7 @@ from ifgym.instructions.instructions_registry import (
     get_registry_revision,
     history_instruction_kwargs,
 )
+from ifgym.instructions.non_verifiable import get_approved_phrasing_templates
 from ifgym.templates.activation_rules import ThisTurnOnly, UntilRevoked
 from ifgym.templates.phrasing import PhrasingsRegistry
 from ifgym.templates.single_turn_rules import (
@@ -190,14 +191,19 @@ class Episode:
         checker_kwargs = dict(kwargs)
         checker_kwargs.update(history_instruction_kwargs(cid, None, []))
         canonical = INSTRUCTION_DICT[cid](cid).build_description(**checker_kwargs)
+        phrasing_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in {"prompt_to_repeat", "previous_response", "previous_responses"}
+        }
         phrases = {canonical}
+        for template in get_approved_phrasing_templates(cid):
+            try:
+                phrases.add(template.format(**phrasing_kwargs))
+            except (KeyError, ValueError) as error:
+                raise ValueError(f"approved phrasing template for {cid!r} has invalid event arguments") from error
         if self._phrasing_registry is not None:
             entry = self._phrasing_registry.get_entry(cid)
-            phrasing_kwargs = {
-                key: value
-                for key, value in kwargs.items()
-                if key not in {"prompt_to_repeat", "previous_response", "previous_responses"}
-            }
             if entry is not None and entry.strategy != "dynamic" and set(entry.kwargs_schema) == set(phrasing_kwargs):
                 phrases.update(template.format(**phrasing_kwargs) for template in entry.phrasings)
 
