@@ -9,6 +9,8 @@ import json
 import random
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from hashlib import sha256
 from typing import Any, Literal, Mapping
 
@@ -145,10 +147,16 @@ def _retry_delay(base_delay: float, retry_after: Any = None) -> float:
     if retry_after is not None:
         try:
             requested = float(retry_after)
-            if requested >= 0:
-                return min(requested, 30.0)
         except (TypeError, ValueError):
-            pass
+            try:
+                retry_at = parsedate_to_datetime(str(retry_after))
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                requested = (retry_at - datetime.now(timezone.utc)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                requested = -1
+        if requested >= 0:
+            return min(requested, 30.0)
     return base_delay + random.uniform(0.0, min(0.25 * base_delay, 1.0))
 
 

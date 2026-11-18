@@ -178,6 +178,7 @@ def test_retry_after_is_bounded_and_preferred():
 
     assert _retry_delay(1, "2.5") == 2.5
     assert _retry_delay(1, "999") == 30.0
+    assert _retry_delay(1, "Wed, 21 Oct 2037 07:28:00 GMT") > 1
     assert _retry_delay(1, "invalid") >= 1
 
 
