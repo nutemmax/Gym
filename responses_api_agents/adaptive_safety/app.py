@@ -498,7 +498,7 @@ class AdaptiveSafetyAgent(SimpleResponsesAPIAgent):
             prompt_ordinal=prompt_ordinal, stage_id=self.config.stage_id,
         )
         if mode is SafetyMode.OR:
-            cap = min(cap, 3)
+            cap = 1
         if not 1 <= cap <= 7:
             raise ValueError("pilot planned horizon must be between one and seven turns")
         started = asyncio.get_running_loop().time()
