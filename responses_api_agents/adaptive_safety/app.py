@@ -269,14 +269,18 @@ class AdaptiveSafetyAgent(SimpleResponsesAPIAgent):
                 else self.config.side_output_limit_tokens
             ),
             "temperature": 0.7 if server_name == self.config.attacker_model_server.name else 0,
-            "seed": self.config.run_seed if seed is None else seed,
             "text": {"format": {"type": "json_object"}},
             "store": False,
-            "metadata": {"adaptive_request_id": logical_request_id},
+            "metadata": {
+                "adaptive_request_id": logical_request_id,
+                "extra_body": json.dumps(
+                    {"seed": self.config.run_seed if seed is None else seed},
+                    separators=(",", ":"),
+                ),
+            },
         }
         if server_name == self.config.attacker_model_server.name:
             payload["top_p"] = 0.95
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
         started = perf_counter()
         deadline = asyncio.get_running_loop().time() + self.config.side_total_timeout_seconds
         request_count = 0
@@ -356,7 +360,8 @@ class AdaptiveSafetyAgent(SimpleResponsesAPIAgent):
                                 "role": self._role_name(server_name), "alias": server_name,
                                 "latency_seconds": round(perf_counter() - started, 3),
                                 "attempts": request_count, "retry_wait_seconds": round(retry_wait_seconds, 3),
-                                "request_id": logical_request_id, "seed": payload.get("seed"), **token_totals,
+                                "request_id": logical_request_id, "provider_seed": self.config.run_seed if seed is None else seed,
+                                "provider_seed_transport": "metadata.extra_body", **token_totals,
                             })
                         return parsed
             raise AssertionError("bounded side call fell through")
@@ -366,7 +371,8 @@ class AdaptiveSafetyAgent(SimpleResponsesAPIAgent):
                     "role": self._role_name(server_name), "alias": server_name,
                     "latency_seconds": round(perf_counter() - started, 3),
                     "attempts": request_count, "retry_wait_seconds": round(retry_wait_seconds, 3),
-                    "request_id": logical_request_id, "seed": payload.get("seed"),
+                    "request_id": logical_request_id, "provider_seed": self.config.run_seed if seed is None else seed,
+                    "provider_seed_transport": "metadata.extra_body",
                     "status_code": self._http_status(error), "retry_after_seconds": self._retry_after_seconds(error),
                     "failed": True, "error": type(error).__name__, **token_totals,
                 })

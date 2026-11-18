@@ -6,7 +6,7 @@ import hashlib
 import json
 import pytest
 from pydantic import ValidationError
-from nemo_gym.core import NeMoGymResponse, NeMoGymResponseOutputMessageForTraining
+from nemo_gym.core import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming, NeMoGymResponseOutputMessageForTraining
 from responses_api_agents.adaptive_safety.app import AdaptiveSafetyAgent, AdaptiveRunRequest
 from responses_api_agents.adaptive_safety.policy import (
     ActorDecision, JudgeResult, SafetyMode, SourceContractError, curriculum_stage,
@@ -310,8 +310,32 @@ def test_side_call_retries_429_without_changing_payload_and_keeps_request_id(mon
     assert len(attempts) == 2
     assert attempts[0]["payload"] == attempts[1]["payload"]
     assert attempts[0]["request_id"] == attempts[1]["request_id"] == "stable-logical-id"
+    request_body = attempts[0]["payload"]
+    assert "seed" not in request_body and "chat_template_kwargs" not in request_body
+    native_request = NeMoGymResponseCreateParamsNonStreaming.model_validate(request_body)
+    assert native_request.metadata["adaptive_request_id"] == "stable-logical-id"
+    assert json.loads(native_request.metadata["extra_body"]) == {"seed": 17}
+
+    from types import SimpleNamespace
+    from nemo_gym.models.chat_completions_converter import VLLMConverter
+    from responses_api_models.vllm_model.app import VLLMModel
+    native_adapter = SimpleNamespace(
+        config=SimpleNamespace(
+            drop_unrepresentable_request_fields=False,
+            forward_unvalidated_reasoning_effort=False,
+        ),
+        _converter=VLLMConverter(
+            return_token_id_information=False, uses_reasoning_parser=False,
+        ),
+    )
+    converted = VLLMModel._responses_to_chat_request(native_adapter, native_request)
+    assert converted.metadata["adaptive_request_id"] == "stable-logical-id"
+    assert json.loads(converted.metadata["extra_body"]) == {"seed": 17}
+
     assert metrics[-1]["attempts"] == 2
     assert metrics[-1]["request_id"] == "stable-logical-id"
+    assert metrics[-1]["provider_seed"] == 17
+    assert metrics[-1]["provider_seed_transport"] == "metadata.extra_body"
 
 
 def test_side_total_deadline_includes_semaphore_queue(monkeypatch: pytest.MonkeyPatch) -> None:
