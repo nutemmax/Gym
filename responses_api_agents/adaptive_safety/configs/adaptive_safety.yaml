@@ -17,6 +17,10 @@ adaptive_safety_agent:
         adaptive_validator_model: swissai:research-account
       policy_timeout_seconds: 120
       side_timeout_seconds: 60
+      side_total_timeout_seconds: 300
+      side_max_provider_attempts: 4
+      side_retry_base_seconds: 0.5
+      side_retry_max_seconds: 30
       episode_timeout_seconds: 900
       admission_timeout_seconds: 30
       policy_context_limit_tokens: 15360

@@ -7,10 +7,15 @@ import asyncio
 import hashlib
 import json
 import logging
+import random
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import uuid
 from time import perf_counter, time
 from collections.abc import Mapping
 from typing import Any, ClassVar
 
+from aiohttp import ClientError
 from fastapi import Body, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -48,6 +53,10 @@ class AdaptiveSafetyConfig(BaseResponsesAPIAgentConfig):
     endpoint_quota_keys: dict[str, str]
     policy_timeout_seconds: float = Field(default=120, gt=0)
     side_timeout_seconds: float = Field(default=60, gt=0)
+    side_total_timeout_seconds: float = Field(default=300, gt=0)
+    side_max_provider_attempts: int = Field(default=4, ge=1, le=4)
+    side_retry_base_seconds: float = Field(default=0.5, gt=0)
+    side_retry_max_seconds: float = Field(default=30, gt=0)
     episode_timeout_seconds: float = Field(default=900, gt=0)
     admission_timeout_seconds: float = Field(default=30, gt=0)
     policy_context_limit_tokens: int = Field(default=15360, ge=1)
@@ -196,15 +205,59 @@ class AdaptiveSafetyAgent(SimpleResponsesAPIAgent):
         self._wait_token_id = wait_token_id
         return raw["prompt_token_count"]
 
+    @staticmethod
+    def _http_status(error: BaseException) -> int | None:
+        for item in (error, getattr(error, "response", None), error.__cause__):
+            for name in ("status", "status_code"):
+                value = getattr(item, name, None) if item is not None else None
+                if isinstance(value, int) and not isinstance(value, bool):
+                    return value
+        return None
+
+    @staticmethod
+    def _retry_after_seconds(error: BaseException) -> float | None:
+        for item in (error, getattr(error, "response", None), error.__cause__):
+            headers = getattr(item, "headers", None) if item is not None else None
+            if headers is None:
+                continue
+            value = headers.get("Retry-After")
+            if value is None:
+                continue
+            try:
+                delay = float(value)
+            except (TypeError, ValueError):
+                try:
+                    target = parsedate_to_datetime(str(value))
+                    if target.tzinfo is None:
+                        target = target.replace(tzinfo=timezone.utc)
+                    delay = (target - datetime.now(timezone.utc)).total_seconds()
+                except (TypeError, ValueError, OverflowError):
+                    continue
+            return max(0.0, delay)
+        return None
+
+    @classmethod
+    def _is_transient_side_error(cls, error: BaseException) -> bool:
+        status = cls._http_status(error)
+        return (
+            status in {408, 425, 429, 500, 502, 503, 504}
+            or isinstance(error, (TimeoutError, asyncio.TimeoutError, OSError, ClientError))
+        )
+
     async def _side_call(
         self, server_name: str, prompt: str, envelope: Mapping[str, Any], *,
         schema: type[BaseModel] | None = None, seed: int | None = None,
         call_metrics: list[dict[str, Any]] | None = None,
         request_id: str | None = None,
         max_attempts: int = 2,
+        max_provider_attempts: int | None = None,
     ) -> dict[str, Any]:
         if not 1 <= max_attempts <= 2:
-            raise ValueError("side-call attempts must be one or two")
+            raise ValueError("side-call generation attempts must be one or two")
+        provider_attempt_limit = self.config.side_max_provider_attempts if max_provider_attempts is None else max_provider_attempts
+        if not 1 <= provider_attempt_limit <= 4:
+            raise ValueError("side-call provider attempts must be between one and four")
+        logical_request_id = request_id or uuid.uuid4().hex
         payload = {
             "input": [
                 {"role": "system", "content": prompt},
@@ -219,71 +272,105 @@ class AdaptiveSafetyAgent(SimpleResponsesAPIAgent):
             "seed": self.config.run_seed if seed is None else seed,
             "text": {"format": {"type": "json_object"}},
             "store": False,
+            "metadata": {"adaptive_request_id": logical_request_id},
         }
-        if request_id:
-            payload["metadata"] = {"adaptive_request_id": request_id}
         if server_name == self.config.attacker_model_server.name:
             payload["top_p"] = 0.95
             payload["chat_template_kwargs"] = {"enable_thinking": False}
-        async with self._endpoint_semaphore(server_name):
-            started = perf_counter()
-            token_totals = {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0}
-            for attempt in range(max_attempts):
-                try:
-                    response = await asyncio.wait_for(
-                        self._post_model(
-                            server_name, payload, timeout=self.config.side_timeout_seconds,
-                            request_id=request_id,
-                        ),
-                        timeout=self.config.side_timeout_seconds,
-                    )
-                    usage = response.get("usage") if isinstance(response.get("usage"), Mapping) else {}
-                    for key in ("input_tokens", "output_tokens"):
-                        value = usage.get(key)
-                        if isinstance(value, int) and not isinstance(value, bool):
-                            token_totals[key] += value
-                    reasoning = usage.get("reasoning_tokens")
-                    if isinstance(reasoning, int) and not isinstance(reasoning, bool):
-                        token_totals["reasoning_tokens"] += reasoning
-                    details = usage.get("output_tokens_details")
-                    if isinstance(details, Mapping):
-                        reasoning = details.get("reasoning_tokens")
+        started = perf_counter()
+        deadline = asyncio.get_running_loop().time() + self.config.side_total_timeout_seconds
+        request_count = 0
+        retry_wait_seconds = 0.0
+        token_totals = {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0}
+        request_rng = random.Random(int.from_bytes(hashlib.sha256(logical_request_id.encode()).digest()[:8], "big"))
+        try:
+            # This deadline includes semaphore admission, provider requests, schema repair, and backoff.
+            async with asyncio.timeout(self.config.side_total_timeout_seconds):
+                async with self._endpoint_semaphore(server_name):
+                    for generation_attempt in range(max_attempts):
+                        if generation_attempt:
+                            payload["input"].append({
+                                "role": "user",
+                                "content": "Return one complete JSON object matching the requested schema. Do not add any other text.",
+                            })
+                        while True:
+                            if request_count >= provider_attempt_limit:
+                                raise RuntimeError("side-call provider-attempt limit reached")
+                            remaining = deadline - asyncio.get_running_loop().time()
+                            if remaining <= 0:
+                                raise TimeoutError("side-call total deadline expired")
+                            request_count += 1
+                            try:
+                                response = await asyncio.wait_for(
+                                    self._post_model(
+                                        server_name, payload,
+                                        timeout=min(self.config.side_timeout_seconds, remaining),
+                                        request_id=logical_request_id,
+                                    ),
+                                    timeout=min(self.config.side_timeout_seconds, remaining),
+                                )
+                                break
+                            except Exception as error:
+                                if not self._is_transient_side_error(error) or request_count >= provider_attempt_limit:
+                                    raise
+                                retry_after = self._retry_after_seconds(error)
+                                if retry_after is None:
+                                    base = min(
+                                        self.config.side_retry_max_seconds,
+                                        self.config.side_retry_base_seconds * (2 ** (request_count - 1)),
+                                    )
+                                    delay = min(self.config.side_retry_max_seconds, base * request_rng.uniform(0.75, 1.25))
+                                else:
+                                    delay = retry_after
+                                remaining = deadline - asyncio.get_running_loop().time()
+                                if delay >= remaining:
+                                    raise TimeoutError("side-call retry delay exceeds total deadline") from error
+                                retry_wait_seconds += delay
+                                await asyncio.sleep(delay)
+                        usage = response.get("usage") if isinstance(response.get("usage"), Mapping) else {}
+                        for key in ("input_tokens", "output_tokens"):
+                            value = usage.get(key)
+                            if isinstance(value, int) and not isinstance(value, bool):
+                                token_totals[key] += value
+                        reasoning = usage.get("reasoning_tokens")
                         if isinstance(reasoning, int) and not isinstance(reasoning, bool):
                             token_totals["reasoning_tokens"] += reasoning
-                    text = visible_text(response["output"])
-                    parsed = json.loads(text)
-                    if not isinstance(parsed, dict):
-                        raise ValueError("structured side response must be a JSON object")
-                    if schema is not None:
-                        schema.model_validate(parsed)
-                    if call_metrics is not None:
-                        call_metrics.append({
-                            "role": self._role_name(server_name), "alias": server_name,
-                            "latency_seconds": round(perf_counter() - started, 3),
-                            "attempts": attempt + 1,
-                            "seed": payload.get("seed"), **token_totals,
-                        })
-                    return parsed
-                except (TimeoutError, ValueError, json.JSONDecodeError):
-                    if attempt + 1 >= max_attempts:
+                        details = usage.get("output_tokens_details")
+                        if isinstance(details, Mapping):
+                            reasoning = details.get("reasoning_tokens")
+                            if isinstance(reasoning, int) and not isinstance(reasoning, bool):
+                                token_totals["reasoning_tokens"] += reasoning
+                        text = visible_text(response["output"])
+                        try:
+                            parsed = json.loads(text)
+                            if not isinstance(parsed, dict):
+                                raise ValueError("structured side response must be a JSON object")
+                            if schema is not None:
+                                schema.model_validate(parsed)
+                        except (ValueError, json.JSONDecodeError):
+                            if generation_attempt + 1 >= max_attempts or request_count >= provider_attempt_limit:
+                                raise ValueError("side model returned malformed or schema-invalid JSON")
+                            continue
                         if call_metrics is not None:
                             call_metrics.append({
                                 "role": self._role_name(server_name), "alias": server_name,
                                 "latency_seconds": round(perf_counter() - started, 3),
-                                "attempts": max_attempts, "seed": payload.get("seed"), "failed": True, **token_totals,
+                                "attempts": request_count, "retry_wait_seconds": round(retry_wait_seconds, 3),
+                                "request_id": logical_request_id, "seed": payload.get("seed"), **token_totals,
                             })
-                        raise
-                    payload["input"].append({"role": "user", "content": "Return one complete JSON object matching the requested schema. Do not add any other text."})
-                except Exception:
-                    if call_metrics is not None:
-                        call_metrics.append({
-                            "role": self._role_name(server_name), "alias": server_name,
-                            "latency_seconds": round(perf_counter() - started, 3),
-                            "attempts": attempt + 1, "seed": payload.get("seed"),
-                            "failed": True, **token_totals,
-                        })
-                    raise
-        raise AssertionError("bounded side call fell through")
+                        return parsed
+            raise AssertionError("bounded side call fell through")
+        except Exception as error:
+            if call_metrics is not None:
+                call_metrics.append({
+                    "role": self._role_name(server_name), "alias": server_name,
+                    "latency_seconds": round(perf_counter() - started, 3),
+                    "attempts": request_count, "retry_wait_seconds": round(retry_wait_seconds, 3),
+                    "request_id": logical_request_id, "seed": payload.get("seed"),
+                    "status_code": self._http_status(error), "retry_after_seconds": self._retry_after_seconds(error),
+                    "failed": True, "error": type(error).__name__, **token_totals,
+                })
+            raise
 
     @staticmethod
     def _usage_totals(value: object) -> dict[str, int]:

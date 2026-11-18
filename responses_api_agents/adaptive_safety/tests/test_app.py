@@ -274,3 +274,67 @@ def test_asr_turn_two_uses_actual_reply_and_returns_only_policy_items(monkeypatc
     assert result.reward == -1.0 and result.mask_sample is False
     assert result.instance_config["mask_sample"] is False
     assert result.confirmed_harm_count == 1
+
+
+def test_side_call_retries_429_without_changing_payload_and_keeps_request_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+    import json
+    from aiohttp import ClientResponseError
+    from multidict import CIMultiDict
+
+    agent = make_agent()
+    object.__setattr__(agent, "_endpoint_semaphores", {"policy": asyncio.Semaphore(1), "swissai:research-account": asyncio.Semaphore(1), "sml:judge-service": asyncio.Semaphore(1)})
+    object.__setattr__(agent, "config", agent.config.model_copy(update={"side_total_timeout_seconds": 2.0, "side_max_provider_attempts": 3}))
+    attempts: list[dict[str, object]] = []
+    response = {"output": [{"type": "message", "role": "assistant", "content": [{
+        "type": "output_text", "text": json.dumps({
+            "action": "continue", "transformation": "follow_up", "message": "Could you clarify the safe context?",
+            "response_anchor": "safe context", "reason_code": "ok",
+        }),
+    }]}]}
+
+    async def post_model(self, server_name, payload, *, timeout, token_capture=False, run_body=None, request_id=None):
+        attempts.append({"payload": json.loads(json.dumps(payload)), "request_id": request_id})
+        if len(attempts) == 1:
+            raise ClientResponseError(None, (), status=429, headers=CIMultiDict({"Retry-After": "0"}))
+        return response
+
+    monkeypatch.setattr(AdaptiveSafetyAgent, "_post_model", post_model)
+    metrics: list[dict[str, object]] = []
+    result = asyncio.run(agent._side_call(
+        agent.config.attacker_model_server.name, "system prompt", {"history": []},
+        schema=ActorDecision, seed=17, request_id="stable-logical-id", call_metrics=metrics,
+    ))
+
+    assert result["action"] == "continue"
+    assert len(attempts) == 2
+    assert attempts[0]["payload"] == attempts[1]["payload"]
+    assert attempts[0]["request_id"] == attempts[1]["request_id"] == "stable-logical-id"
+    assert metrics[-1]["attempts"] == 2
+    assert metrics[-1]["request_id"] == "stable-logical-id"
+
+
+def test_side_total_deadline_includes_semaphore_queue(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    agent = make_agent()
+    semaphore = asyncio.Semaphore(1)
+    object.__setattr__(agent, "_endpoint_semaphores", {"policy": asyncio.Semaphore(1), "swissai:research-account": semaphore, "sml:judge-service": asyncio.Semaphore(1)})
+    object.__setattr__(agent, "config", agent.config.model_copy(update={"side_total_timeout_seconds": 0.02}))
+    metrics: list[dict[str, object]] = []
+
+    async def blocked() -> None:
+        await semaphore.acquire()
+        try:
+            with pytest.raises(TimeoutError):
+                await agent._side_call(
+                    agent.config.attacker_model_server.name, "prompt", {},
+                    call_metrics=metrics, request_id="queued-call", max_attempts=1,
+                )
+        finally:
+            semaphore.release()
+
+    asyncio.run(blocked())
+    assert metrics[-1]["attempts"] == 0
+    assert metrics[-1]["request_id"] == "queued-call"
+    assert metrics[-1]["failed"] is True
